@@ -1,6 +1,6 @@
 [package]
 name = "async-priority-lock"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 keyworsd = ["async", "mutex", "lock", "futures"]
@@ -23,7 +23,6 @@ spin = { version = "0.10.0", optional = true,  default-features = false, feature
 
 [dev-dependencies]
 anyhow = "1.0.101"
-ctrlc = "3.5.2"
 futures = "0.3.32"
 rand = { version = "0.10.0", features = ["sys_rng"] }
 tokio = { version = "1.49.0", features = ["full"] }
