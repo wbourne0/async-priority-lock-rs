@@ -11,7 +11,6 @@ use tokio::time::{Duration, sleep};
 static MY_LOCK: PriorityMutex<usize, Vec<usize>> = PriorityMutex::new(vec![]);
 
 async fn append(priority: usize, value: usize) {
-    // lock at priority zero
     loop {
         let mut guard = MY_LOCK.lock(priority).await;
 
