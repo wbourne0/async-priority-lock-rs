@@ -1,0 +1,30 @@
+[package]
+name = "async-priority-lock"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+keyworsd = ["async", "mutex", "lock", "futures"]
+description = "A priority-based async lock.  Optionally no-std."
+repository = "https://github.com/wbourne0/async-priority-lock-rs"
+readme = "README.md"
+categories = ["asynchronous", "no-std"]
+
+[features]
+evict = []
+no-std = ["dep:spin"]
+serde = ["dep:serde"]
+
+[profile.test]
+opt-level = 3
+
+[dependencies]
+serde = { version = "1.0.228", default-features = false, optional = true }
+spin = { version = "0.10.0", optional = true,  default-features = false, features = ["mutex", "spin_mutex"] }
+
+[dev-dependencies]
+anyhow = "1.0.101"
+ctrlc = "3.5.2"
+futures = "0.3.32"
+rand = { version = "0.10.0", features = ["sys_rng"] }
+tokio = { version = "1.49.0", features = ["full"] }
+
