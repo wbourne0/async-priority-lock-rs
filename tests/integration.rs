@@ -1,10 +1,13 @@
 #![cfg(feature = "evict")]
 use async_priority_lock::*;
+use queue::*;
 use std::{
     alloc::GlobalAlloc,
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
+    fmt::Debug,
+    marker::Send,
     sync::{
-        Arc, LazyLock, Mutex as SyncMutex,
+        Arc, Mutex as SyncMutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{self, Duration},
@@ -80,10 +83,17 @@ unsafe impl<G: GlobalAlloc> GlobalAlloc for StatAllocator<G> {
     }
 }
 
-#[derive(Default, Debug)]
 #[repr(C)]
-struct Resource<const FIFO: bool, const LOWEST_FIRST: bool> {
-    intent: PriorityMutex<usize, SyncMutex<Vec<usize>>, FIFO, LOWEST_FIRST>,
+struct Resource<P: Priority + Default, Q: MutexQueue<P>> {
+    intent: Mutex<P, SyncMutex<Vec<usize>>, Q>,
+}
+
+impl<P: Priority + Default, Q: MutexQueue<P>> Default for Resource<P, Q> {
+    fn default() -> Self {
+        Self {
+            intent: Default::default(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -129,15 +139,15 @@ impl<'a> Drop for NotTrashGuard<'a> {
     }
 }
 
-impl<const FIFO: bool, const LOWEST_FIRST: bool> Resource<FIFO, LOWEST_FIRST> {
+impl<P: Priority + From<usize> + Default + Debug, Q: MutexQueue<P>> Resource<P, Q> {
     async fn get(&self, bar: &BarrierThatIsNotTrash, holder: usize) {
         loop {
-            let mut intent = self.intent.lock(holder).await;
+            LOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+            let mut intent = self.intent.lock_from(holder).await;
 
             select! {
                 _ = bar.wait() => {},
-                _ = PriorityMutexGuard::evicted(&mut intent) => {
-                    //
+                _ = MutexGuard::evicted(&mut intent) => {
                     if !bar.ready() {
                         EVICT_COUNT.fetch_add(1, Ordering::SeqCst);
                         continue
@@ -149,22 +159,25 @@ impl<const FIFO: bool, const LOWEST_FIRST: bool> Resource<FIFO, LOWEST_FIRST> {
             // we use try_lock with unwrap here to ensure we panic in case we accidentally give
             // multiple guards
             x.try_lock().unwrap().push(holder);
+
             return;
         }
     }
-    async fn get_no_wait(&self, holder: usize) {
-        let guard = self.intent.lock(holder).await;
 
-        // we use try_lock with unwrap here to ensure we panic in case we accidentally give
+    async fn get_no_wait(&self, holder: usize) {
+        LOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+        let guard = self.intent.lock_from(holder).await;
+
+        // w; use try_lock with unwrap here to ensure we panic in case we accidentally give
         // multiple guards
         guard.try_lock().unwrap().push(holder)
     }
 }
 
-async fn run_seq_job<const FIFO: bool, const LOWEST_FIRST: bool>(
+async fn run_seq_job<P: Priority + Default + From<usize> + Debug, Q: MutexQueue<P>>(
     id: usize,
     bar: Arc<tokio::sync::Barrier>,
-    res: Vec<Arc<Resource<FIFO, LOWEST_FIRST>>>,
+    res: Vec<Arc<Resource<P, Q>>>,
 
     _exit: broadcast::Sender<()>,
 ) {
@@ -176,7 +189,7 @@ async fn run_seq_job<const FIFO: bool, const LOWEST_FIRST: bool>(
         _ = join_all(res.into_iter().map(|x| async {
         // explicitly move x...
         let bruh = x;
-        bruh.get(&subbar, id ).await
+        bruh.get(&subbar, id).await
     }))
      => {},
         _ = subbar.tx.wait() => {},
@@ -184,29 +197,32 @@ async fn run_seq_job<const FIFO: bool, const LOWEST_FIRST: bool>(
     };
 }
 
+static LOCK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static EVICT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-const RESOURCE_COUNT: usize = 2048;
+const RESOURCE_COUNT: usize = 0x80000;
+// const RESOURCE_COUNT: usize = 1;
 // Count of jobs that immediately get a random resource every microsecond until multi jobs complete
-const RAND_JOB_COUNT: usize = 2048;
+const RAND_JOB_COUNT: usize = 128;
 // Count of jobs which wait until they acquire RESOURCES_USED distinct resources (evicting until
 // all are acquired)
-const MULTI_RES_JOB_COUNT: usize = 512;
+const MULTI_RES_JOB_COUNT: usize = 0x2000;
 const JOB_COUNT: usize = RAND_JOB_COUNT + MULTI_RES_JOB_COUNT;
 /// Count of resources each multi res job acquires
 const RESOURCES_USED: usize = 64;
+// const RESOURCES_USED: usize = 1;
 
 static WTF: AtomicU64 = AtomicU64::new(0);
-fn seq_job<const FIFO: bool, const LOWEST_FIRST: bool>(
+fn seq_job<P: 'static + Priority + Default + From<usize> + Debug, Q: 'static + MutexQueue<P>>(
     id: usize,
     bar: &Arc<tokio::sync::Barrier>,
-    all_resources: &Vec<Arc<Resource<FIFO, LOWEST_FIRST>>>,
+    all_resources: &Vec<Arc<Resource<P, Q>>>,
     exit: broadcast::Sender<()>,
-) -> impl Future<Output = ()> + 'static + Send {
+) -> impl Future<Output = ()> + 'static {
     let mut rng = rand::rng();
     let now = Instant::now();
 
-    let resources: Vec<_> = all_resources
+    let resources: Vec<_> = (&*all_resources)
         .sample(&mut rng, RESOURCES_USED)
         .into_iter()
         .map(|x| x.clone())
@@ -220,10 +236,14 @@ fn seq_job<const FIFO: bool, const LOWEST_FIRST: bool>(
     run_seq_job(id, bar.clone(), resources, exit)
 }
 
-async fn step_job<const PRIO: usize, const FIFO: bool, const LOWEST_FIRST: bool>(
+async fn step_job<
+    const PRIO: usize,
+    P: Priority + Default + From<usize> + Debug,
+    Q: MutexQueue<P>,
+>(
     start: Arc<tokio::sync::Barrier>,
     mut exit: broadcast::Receiver<()>,
-    resources: &'static Vec<Arc<Resource<FIFO, LOWEST_FIRST>>>,
+    resources: Arc<Vec<Arc<Resource<P, Q>>>>,
 ) {
     start.wait().await;
     loop {
@@ -239,29 +259,37 @@ async fn step_job<const PRIO: usize, const FIFO: bool, const LOWEST_FIRST: bool>
 }
 
 // fn test(x: impl Send + Sync) {}
-// fn test_<'a, const B: bool>(x: PriorityMutexGuard<'a, usize, std::rc::Rc<usize>, B>) {
+// fn test_<'a, const B: bool>(x: MutexGuard<'a, usize, std::rc::Rc<usize>, B>) {
 //     test(x)
 // }
 //
 // #[tokio::main]
-async fn fun<const STEP_PRIO: usize, const FIFO: bool, const LOWEST_FIRST: bool>(
-    items: &'static Vec<Arc<Resource<FIFO, LOWEST_FIRST>>>,
-) -> Result<time::Duration> {
+async fn fun<
+    P: Priority + From<usize> + Default + Send + 'static + Debug,
+    Q: 'static + Sync + Send + MutexQueue<P>,
+    const STEP_PRIO: usize,
+>() -> Result<(&'static str, time::Duration)>
+where
+    Q::Handle: Send + Sync,
+{
+    let mut items = Vec::with_capacity(RESOURCE_COUNT);
+    items.resize_with(RESOURCE_COUNT, Arc::<Resource<P, Q>>::default);
+    let resources = Arc::new(items);
+
     let barier = Arc::new(tokio::sync::Barrier::new(JOB_COUNT + 1));
 
     let (exit_tx, exit_rx) = broadcast::channel(1);
 
     let set = JoinSet::from_iter((0..JOB_COUNT).map(|job| {
         let bruh = if job < MULTI_RES_JOB_COUNT {
-            Ok(seq_job(job, &barier, &items, exit_tx.clone()))
+            Ok(seq_job(job, &barier, &resources, exit_tx.clone()))
         } else {
-            Err(step_job::<STEP_PRIO, _, _>(
+            Err(step_job::<STEP_PRIO, P, Q>(
                 barier.clone(),
                 exit_rx.resubscribe(),
-                items,
+                resources.clone(),
             ))
         };
-
         async move {
             match bruh {
                 Ok(x) => x.await,
@@ -284,8 +312,8 @@ async fn fun<const STEP_PRIO: usize, const FIFO: bool, const LOWEST_FIRST: bool>
     // but we expect there to be quite a few evicts with the current set
     // (well over 25k).  If we're not getting many evictions, then there's something wrong with the
     // testing appoach - as we want to test everything many times.
-    if evicts < RESOURCE_COUNT {
-        return Err(anyhow!("unexpectedly small evict count: {}", evicts));
+    if evicts < RAND_JOB_COUNT * 5 {
+        return Err(anyhow!("unexpectedly small evict count: {} ", evicts));
     }
 
     let mut map: HashSet<(usize, usize)> =
@@ -295,8 +323,8 @@ async fn fun<const STEP_PRIO: usize, const FIFO: bool, const LOWEST_FIRST: bool>
 
     // PERF: Could make this multithreaded / split into batches then merge.  This is by far the
     // slowest part of the test.
-    for res in items {
-        let outer = res.intent.lock(0).await;
+    for res in resources.iter() {
+        let outer = res.intent.lock_from(0).await;
         let mut l = outer.lock().unwrap();
 
         for (i, x) in l.iter().enumerate() {
@@ -326,28 +354,44 @@ async fn fun<const STEP_PRIO: usize, const FIFO: bool, const LOWEST_FIRST: bool>
         l.clear();
     }
 
+    let lowest_first = P::from(0).compare(&1.into()).is_gt();
+
     // Again here this number is fairly arbitrary.  It's technically not wrong for all of the
     // lowest priority locks to run in order (e.g. all of the low ones happen to run and complete
     // before higher priority ones) but again this doesn't really test for race cases, hence we
     // want to ensure we get a reasonably high bias.
-    const SEQ_CHANGES: isize = (MULTI_RES_JOB_COUNT * RESOURCES_USED) as isize;
-    if LOWEST_FIRST {
+    const SEQ_CHANGES: isize = (MULTI_RES_JOB_COUNT) as isize;
+    if lowest_first {
         if direction >= -(SEQ_CHANGES) {
             return Err(anyhow!(
-                "bias does not represent enoug high -> low priority {} (wanted {})",
+                "bias does not represent enough high -> low priority {} (wanted {})",
                 direction,
                 -SEQ_CHANGES,
             ));
         }
     } else if direction < SEQ_CHANGES {
         return Err(anyhow!(
-            "bias does not represent enoug high -> low priority {} (wanted {})",
+            "bias does not represent enough high -> low priority {} (wanted {})",
             direction,
-            SEQ_CHANGES
+            SEQ_CHANGES,
         ));
     }
 
-    Ok(time)
+    Ok((core::any::type_name::<Q>(), time))
+}
+
+type BoxMutexQueue<P> = SingleLinkBoxQueue<MutexWaiter<P>>;
+
+macro_rules! test_prios {
+    ($i: ident, $q: ty) => {
+        match $i % 4 {
+            0 => fun::<usize, $q, 0>().await,
+            1 => fun::<LowestFirst<usize>, $q, 0>().await,
+            2 => fun::<FIFO<usize>, $q, 0>().await,
+            3 => fun::<LIFO<usize>, $q, 0>().await,
+            _ => unreachable!(),
+        }
+    };
 }
 
 /// Will fail on 1 threaded machines
@@ -355,69 +399,75 @@ async fn fun<const STEP_PRIO: usize, const FIFO: bool, const LOWEST_FIRST: bool>
 pub async fn run() -> Result<()> {
     // println also appears to have some state it lazily initializes, so here we're making sure
     // that is initialized
-    println!("do u like test");
 
-    /// test util to avoid re-allocating. The interior shapes of these structs is identical - it's
-    /// just a matter of which functions are used.  there also aren't any vtables which makes this
-    /// safe
-    fn resources<const FIFO: bool, const LOWEST_FIRST: bool>()
-    -> &'static Vec<Arc<Resource<FIFO, LOWEST_FIRST>>> {
-        static RESOURCES: LazyLock<Vec<Arc<Resource<false, false>>>> = LazyLock::new(|| {
-            let mut items = Vec::with_capacity(RESOURCE_COUNT);
-            items.resize_with(RESOURCE_COUNT, Default::default);
-            items
-        });
-        unsafe { std::mem::transmute(&*RESOURCES) }
-    }
-
-    async fn clear_resources() {
-        for x in resources::<false, false>() {
-            let guard = x.intent.lock(0).await;
-            let mut vec = guard.lock().unwrap();
-            vec.clear();
-            vec.shrink_to_fit();
-        }
-    }
-
-    const T: usize = usize::MIN;
+    println!("hi :)");
     // callnig this function once calls some state to be lazily initialized in tokio, and since we
     // track allocations we need to measure after those have been initialized once.
-    fun::<T, false, false>(resources()).await?;
-    clear_resources().await; // clear before getting mem values
+    fun::<usize, BoxMutexQueue<usize>, { usize::MIN }>().await?;
 
     let start_alloc_bytes = TOTAL_ALLOCATED.load(Ordering::Relaxed);
     let start_alloc_count = ALLOC_COUNT.load(Ordering::Relaxed);
 
-    const TEST_COUNT: usize = 512;
-
-    let mut timings: [Duration; 4] = Default::default();
     {
-        for i in 0..TEST_COUNT {
-            const MAX: usize = usize::MAX;
-            const MIN: usize = usize::MIN;
+        // Second value is for a custom measurement which is added manually around the functions which
+        // should be timed.  code added when needed.
+        let mut results: BTreeMap<&'static str, [Duration; 2]> = BTreeMap::new();
 
-            let delay = match i % 4 {
-                0 => fun::<MAX, false, false>(resources()).await,
-                1 => fun::<MIN, false, true>(resources()).await,
-                2 => fun::<MAX, true, false>(resources()).await,
-                3 => fun::<MIN, true, true>(resources()).await,
+        const PRIO_COUNT: usize = 4;
+        const QUEUE_COUNT: usize = 4;
+        const BRANCH_COUNT: usize = PRIO_COUNT * QUEUE_COUNT;
+
+        const ROUND_COUNT: usize = 32;
+        const TEST_COUNT: usize = ROUND_COUNT * BRANCH_COUNT;
+        LOCK_COUNT.swap(0, Ordering::Relaxed);
+
+        for i in 0..TEST_COUNT {
+            // pre sem:
+            // arena  true | high priority inter: false : avg  60.525399ms total 7.747251044s
+            // arena  true | high priority inter:  true : avg  60.631249ms total 7.760799844s
+            // arena false | high priority inter: false : avg  88.078902ms total 11.274099413s
+            // arena false | high priority inter:  true : avg  86.885806ms total 11.121383207s
+            let (name, delay) = match (i / PRIO_COUNT) % 4 {
+                0 => test_prios!(i, SingleLinkArenaQueue<_>),
+                // 1 => test_prios!(i, SingleLinkArenaQueue<_>),
+                // 2 => test_prios!(i, SingleLinkArenaQueue<_>),
+                // 3 => test_prios!(i, SingleLinkArenaQueue<_>),
+                1 => test_prios!(i, DualLinkArenaQueue<_>),
+                2 => test_prios!(i, SingleLinkBoxQueue<_>),
+                3 => test_prios!(i, DualLinkBoxQueue<_>),
                 _ => unreachable!(),
             }?;
-            timings[i % 4] += delay;
 
-            println!("run {} {:?}", i, delay);
+            let entry = results.entry(name).or_default();
+            entry[0] += delay;
+            let avg = Duration::default();
+            entry[1] += avg;
+
+            println!(
+                "run {: <4} {:?} {:?} - {}",
+                i,
+                delay,
+                avg,
+                name.replace("async_priority_lock::", "")
+                    .replace("queue::", "")
+                    .replace("arena::", "")
+                    .replace("mutex::", ""),
+            );
         }
-    }
-    clear_resources().await; // clear before checking new mem values
 
-    for (i, dur) in timings.iter().enumerate() {
-        println!(
-            "fifo {: <5} | low first: {: <5} : avg {: <10?} total {: <10?}",
-            i & 1 != 0,
-            i & 2 != 0,
-            dur.div_f64((TEST_COUNT / 4) as f64),
-            dur
-        );
+        for (i, [dur, mes]) in results {
+            println!(
+                "avg: {: >12?} (total: {: >12?}) | measured avg: {: >12?} total: {: >12?} - {}",
+                dur / (ROUND_COUNT as u32),
+                dur,
+                mes / (ROUND_COUNT as u32),
+                mes,
+                i.replace("async_priority_lock::", "")
+                    .replace("queue::", "")
+                    .replace("arena::", "")
+                    .replace("box::", "")
+            )
+        }
     }
 
     let end_alloc_count = ALLOC_COUNT.load(Ordering::Relaxed);

@@ -1,3 +1,15 @@
 {
-  "rust_analyzer": { "settings.rust-analyzer.cargo.features": ["evict", "serde"] }
+  "rust_analyzer": {
+    "settings.rust-analyzer.cargo.features": [
+      "evict",
+      "serde",
+      "semaphore-total",
+      "box-queue",
+      "const-default",
+      "mutex",
+      "semaphore",
+      "std",
+      "arena-queue"
+    ]
+  }
 }
