@@ -549,7 +549,6 @@ impl<'a, P: Priority, Q: SemaphoreQueue<P>> Debug for SemaphorePermit<'a, P, Q> 
 ///
 /// The default queue used may change, however its characteristics will remain the same, notably:
 /// - If P is [`Send`]` + `[`Sync`] the queue will always be [`Send`]` + `[`Sync`]
-#[derive(Default)]
 pub struct Semaphore<
     P: Priority,
     #[cfg(any(feature = "arena-queue", feature = "box-queue"))] Q: SemaphoreQueue<P> = DefaultSemaphoreQueue<P>,
@@ -1003,4 +1002,12 @@ impl<P: Priority, Q: SemaphoreQueue<P>> Semaphore<P, Q> {
 #[cfg(feature = "const-default")]
 impl<P: Priority, Q: ConstDefault + SemaphoreQueue<P>> ConstDefault for Semaphore<P, Q> {
     const DEFAULT: Self = Self(RwLock::new(ConstDefault::DEFAULT));
+}
+
+/// Creates a new [Semaphore] with zero permits.
+impl<P: Priority, Q: SemaphoreQueue<P>> Default for Semaphore<P, Q> {
+    #[inline]
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
