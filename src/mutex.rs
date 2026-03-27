@@ -18,7 +18,9 @@ use core::{
 #[cfg(feature = "const-default")]
 use const_default::ConstDefault;
 
-impl<'a, P: Priority, T, Q: MutexQueue<P>> waiter::WaiterHandle for MutexGuard<'a, P, T, Q> {
+impl<'a, P: Priority, T: ?Sized, Q: MutexQueue<P>> waiter::WaiterHandle
+    for MutexGuard<'a, P, T, Q>
+{
     #[inline]
     fn with_waker<R>(&self, f: impl FnOnce(&Waiter) -> R) -> R {
         // rust optimizer doesn't seem to be smart enough yet to do branch elimination with
@@ -133,13 +135,13 @@ pub type DefaultMutexQueue<P> = DefaultMutexQueue_<P>;
 ///
 pub struct Mutex<
     P: Priority,
-    T,
+    T: ?Sized,
     #[cfg(any(feature = "box-queue", feature = "arena-queue"))] Q: MutexQueue<P> = DefaultMutexQueue<P>,
     #[cfg(not(any(feature = "box-queue", feature = "arena-queue")))] Q: MutexQueue<P>,
 > {
     queue: RwLock<Q>,
-    data: UnsafeCell<T>,
     _phantom: PhantomData<P>,
+    data: UnsafeCell<T>,
 }
 
 impl<P: Priority, T: Default, Q: MutexQueue<P>> Default for Mutex<P, T, Q> {
@@ -158,9 +160,9 @@ impl<P: Priority, T: Default, Q: MutexQueue<P>> Default for Mutex<P, T, Q> {
 ///
 /// (however, both `Sync` and `Send` are required for the queue; usually these are implemented if P
 /// is `Send` + `Sync`)
-unsafe impl<P: Priority, T: Send, Q: Send + Sync + MutexQueue<P>> Sync for Mutex<P, T, Q> {}
-unsafe impl<P: Priority, T: Send, Q: Send + MutexQueue<P>> Send for Mutex<P, T, Q> {}
-impl<P: Priority, T: Unpin, Q: Unpin + MutexQueue<P>> Unpin for Mutex<P, T, Q> {}
+unsafe impl<P: Priority, T: ?Sized + Send, Q: Send + Sync + MutexQueue<P>> Sync for Mutex<P, T, Q> {}
+unsafe impl<P: Priority, T: ?Sized + Send, Q: Send + MutexQueue<P>> Send for Mutex<P, T, Q> {}
+impl<P: Priority, T: ?Sized + Unpin, Q: Unpin + MutexQueue<P>> Unpin for Mutex<P, T, Q> {}
 
 /// Alias trait for [`PriorityQueue`]`<`[`MutexWaiter<P>`]`>`.
 pub trait MutexQueue<P: Priority>: PriorityQueue<MutexWaiter<P>> {}
@@ -185,23 +187,23 @@ where
 ///
 /// If the `evict` flag is enabled, higher priority requesters will mark held locks for eviction,
 /// which can be subscribed to via [Self::evicted] (associated function).
-pub struct MutexGuard<'a, P: Priority, T, Q: MutexQueue<P>> {
+pub struct MutexGuard<'a, P: Priority, T: ?Sized, Q: MutexQueue<P>> {
     mutex: &'a Mutex<P, T, Q>,
     node: ManuallyDrop<Q::Handle>,
 }
 
-unsafe impl<'a, P: Priority, T: Sync, Q: MutexQueue<P>> Sync for MutexGuard<'a, P, T, Q> where
+unsafe impl<'a, P: Priority, T: ?Sized + Sync, Q: MutexQueue<P>> Sync for MutexGuard<'a, P, T, Q> where
     Mutex<P, T, Q>: Sync
 {
 }
-unsafe impl<'a, P: Priority, T: Send, Q: MutexQueue<P>> Send for MutexGuard<'a, P, T, Q>
+unsafe impl<'a, P: Priority, T: ?Sized + Send, Q: MutexQueue<P>> Send for MutexGuard<'a, P, T, Q>
 where
     Mutex<P, T, Q>: Sync,
     Q::Handle: Send,
 {
 }
 
-impl<'a, P: Priority, T, Q: MutexQueue<P>> Display for MutexGuard<'a, P, T, Q>
+impl<'a, P: Priority, T: ?Sized, Q: MutexQueue<P>> Display for MutexGuard<'a, P, T, Q>
 where
     T: Display,
 {
@@ -211,7 +213,7 @@ where
     }
 }
 
-impl<'a, P: Priority, T, Q: MutexQueue<P>> Debug for MutexGuard<'a, P, T, Q>
+impl<'a, P: Priority, T: ?Sized, Q: MutexQueue<P>> Debug for MutexGuard<'a, P, T, Q>
 where
     T: Debug,
 {
@@ -221,7 +223,7 @@ where
     }
 }
 
-impl<'a, P: Priority, T, Q: MutexQueue<P>> Deref for MutexGuard<'a, P, T, Q> {
+impl<'a, P: Priority, T: ?Sized, Q: MutexQueue<P>> Deref for MutexGuard<'a, P, T, Q> {
     type Target = T;
 
     #[inline]
@@ -230,14 +232,14 @@ impl<'a, P: Priority, T, Q: MutexQueue<P>> Deref for MutexGuard<'a, P, T, Q> {
     }
 }
 
-impl<'a, P: Priority, T, Q: MutexQueue<P>> DerefMut for MutexGuard<'a, P, T, Q> {
+impl<'a, P: Priority, T: ?Sized, Q: MutexQueue<P>> DerefMut for MutexGuard<'a, P, T, Q> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.mutex.data.get() }
     }
 }
 
-impl<'a, P: Priority, T, Q: MutexQueue<P>> MutexGuard<'a, P, T, Q> {
+impl<'a, P: Priority, T: ?Sized, Q: MutexQueue<P>> MutexGuard<'a, P, T, Q> {
     /// Returns a future which resolves when/if another, higher priority holder attempts to acquire
     /// the lock.
     ///
@@ -254,7 +256,7 @@ impl<'a, P: Priority, T, Q: MutexQueue<P>> MutexGuard<'a, P, T, Q> {
     const HAS_PURE_LOAD: bool = Q::Handle::LOAD_PURE.is_some();
 }
 
-impl<'a, P: Priority, T, Q: MutexQueue<P>> Drop for MutexGuard<'a, P, T, Q> {
+impl<'a, P: Priority, T: ?Sized, Q: MutexQueue<P>> Drop for MutexGuard<'a, P, T, Q> {
     #[inline]
     fn drop(&mut self) {
         let mut queue = self.mutex.queue.write();
@@ -286,7 +288,7 @@ impl Display for TryLockError {
 
 impl core::error::Error for TryLockError {}
 
-impl<P: Priority, T, Q: MutexQueue<P>> Debug for Mutex<P, T, Q>
+impl<P: Priority, T: ?Sized, Q: MutexQueue<P>> Debug for Mutex<P, T, Q>
 where
     T: Debug,
     P: Default,
@@ -302,7 +304,7 @@ where
     }
 }
 
-impl<P: Priority, T, Q: MutexQueue<P>> Mutex<P, T, Q> {
+impl<P: Priority, T: ?Sized, Q: MutexQueue<P>> Mutex<P, T, Q> {
     /// Try to acquire the lock without blocking or requesting eviction of the current holder.
     ///
     /// Priority will be stored in guard; higher priority requesters will try to evict the returned
@@ -403,7 +405,10 @@ impl<P: Priority, T, Q: MutexQueue<P>> Mutex<P, T, Q> {
 
     #[inline]
     /// Create a new [Mutex], unlocked and ready for use.
-    pub fn new(val: T) -> Self {
+    pub fn new(val: T) -> Self
+    where
+        T: Sized,
+    {
         Self {
             queue: Default::default(),
             data: UnsafeCell::new(val),
@@ -420,6 +425,7 @@ impl<P: Priority, T, Q: MutexQueue<P>> Mutex<P, T, Q> {
     pub const fn const_new(val: T) -> Self
     where
         Q: const_default::ConstDefault,
+        T: Sized,
     {
         Self {
             queue: RwLock::new(Q::DEFAULT),

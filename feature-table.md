@@ -2,7 +2,7 @@
 | Feature | Default | Description
 |---|:-:|---|
 |`evict` | ❌ | Enables eviction for [Semaphore] and [Mutex].
-| `semaphore-cap` | ❌ | Enables [Semaphore::total_permits] and [Semaphore::acquire_within_total]. |
+| `semaphore-total` | ❌ | Enables [Semaphore::total_permits] and [Semaphore::acquire_within_total]. |
 | `serde` | ❌ | Implement [serde::Deserialize] for [Mutex] + builtin [Priority] structs. |
 | `box-queue` | ❌ | Enables [queue::boxed]. |
 | `arena-queue` | ✅ | Enables [queue::arena]. |
